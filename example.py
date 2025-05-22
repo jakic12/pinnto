@@ -15,7 +15,7 @@ import math
 # importing custom modules
 from loads import *
 from constraints import DensityConstraint
-from fesolvers import FESolver, CvxFEA, CGFEA
+from fesolvers import FESolver, CvxFEA, CGFEA, PiNN_FEA
 from topopt import Topopt
 from plotting import Plot
 
@@ -54,10 +54,10 @@ history = True
 den_con = DensityConstraint(nelx, nely, move, volume_frac=volfrac)
 
 # loading case object, other classes can be selected and created
-load = Canti(nelx, nely, young, Emin, poisson)
+load = Beam(nelx, nely, young, Emin, poisson)
 
 # FEA object is generated, other solvers can be selected and created
-fesolver = CvxFEA(verbose=verbose)
+fesolver = PiNN_FEA(verbose=verbose)
 
 # create optimizer object and initialise the problem
 optimizer = Topopt(den_con, load, fesolver, verbose=verbose)

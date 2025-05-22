@@ -96,7 +96,7 @@ class Load(object):
         """
         elx = ntopleft // (self.nely+1)
         ely = ntopleft % (self.nely+1)
-        return elx, ely
+        return np.array([elx, ely]).T
 
     # compute the 4 boundary nodes of an element
     def nodes(self, elx, ely):
