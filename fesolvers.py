@@ -251,8 +251,8 @@ def plot_mixed_arr(arr, load, title=""):
     # Plot the mixed array of size (dim * nely+1 * nelx+1)
     # Reshape the array to (nely+1, nelx+1)
     idx = np.arange(arr.shape[0])
-    arr1 = arr[idx % load.dim == 0].reshape((load.nely+1, load.nelx+1))
-    arr2 = arr[idx % load.dim == 1].reshape((load.nely+1, load.nelx+1))
+    arr1 = arr[idx % load.dim == 0].reshape((load.nelx+1, load.nely+1)).T
+    arr2 = arr[idx % load.dim == 1].reshape((load.nelx+1, load.nely+1)).T
     # Plot the first dimension
     plt.imshow(arr1, cmap='hot', interpolation='nearest')
     plt.colorbar()
@@ -274,7 +274,7 @@ class PiNN_FEA(FESolver):
     verbose : bool
         False if the FEA should not print updates.
     """
-    def __init__(self, verbose=False, epochs=1000, learning_rate=0.001, early_stopping=100):
+    def __init__(self, verbose=False, epochs=1000, learning_rate=0.001, early_stopping=1000):
         super().__init__(verbose)
 
         self.epochs = epochs
@@ -394,8 +394,8 @@ class PiNN_FEA(FESolver):
         """
         fixed_points = np.array(load.fixdofs())
 
-        fixed_in_x_idx = torch.tensor(load.elpos(fixed_points[fixed_points % load.dim == 0]//2))
-        fixed_in_y_idx = torch.tensor(load.elpos((fixed_points[fixed_points % load.dim == 1]-1)//2))
+        fixed_in_x_idx = torch.tensor(load.elpos(fixed_points[fixed_points % load.dim == 1]//2))
+        fixed_in_y_idx = torch.tensor(load.elpos((fixed_points[fixed_points % load.dim == 0]-1)//2))
 
         # h1_i(0,y) = u0_i(y)
         # h1_i(1,y) = u1_i(y)
@@ -416,8 +416,9 @@ class PiNN_FEA(FESolver):
             lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 1] == 1, 0]).int()).int(),
         )
     
-        model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed])
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        #model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed])
+        model = DirichletPINN([200], [u_fixed, v_fixed])
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.2, betas=(0.9, 0.999))#self.learning_rate)
         # x = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
         # y = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
         # points = torch.cat([x, y], dim=1)
@@ -436,13 +437,13 @@ class PiNN_FEA(FESolver):
         free_in_y = load.elpos((free_in_y_idx-1)//2)
         force_arr = torch.tensor(np.array(load.force()))
 
-
         best_loss = np.inf
         early_stopping_counter = 0
         for i in range(self.epochs):
             optimizer.zero_grad()
             output = model(points / torch.tensor([load.nelx+1, load.nely+1]))
             loss = self.calculate_energy_loss(load, points, output, free_in_x, free_in_y, force_arr, torch.tensor(x))
+
             loss.backward()
             print(f"Epoch {i+1}/{self.epochs}, Loss: {loss.item()}")
             optimizer.step()
@@ -464,11 +465,13 @@ class PiNN_FEA(FESolver):
         grid_y, grid_x = torch.meshgrid(points_y, points_x, indexing='ij')
         grid_x = grid_x.flatten()
         grid_y = grid_y.flatten()
+
+        # print(grid_x.shape, grid_y.shape, (load.nely+1)*(load.nelx+1), (load.nely+1,load.nelx+1))
         x = grid_x / (load.nelx + 1)
         y = grid_y / (load.nely + 1)
         out = model(torch.stack([x, y], dim=1).requires_grad_(True)).detach().numpy()
-        u[load.node(grid_x.int(), grid_y.int())*2] = out[:, 0]
-        u[load.node(grid_x.int(), grid_y.int())*2+1] = out[:, 1]
+        u[load.node(grid_x.int(), grid_y.int())*2+1] = out[:, 0]
+        u[load.node(grid_x.int(), grid_y.int())*2] = out[:, 1]
         
         plot_mixed_arr(u, load, title="Displacement field")
 
