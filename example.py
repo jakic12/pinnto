@@ -42,7 +42,7 @@ penal = 3.0
 rmin = 3
 filt = 'sensitivity'
 maxiter = 200
-delta = 0.005
+delta = 0#0.005
 
 # plotting and printing options
 verbose = True
@@ -54,9 +54,10 @@ history = True
 den_con = DensityConstraint(nelx, nely, move, volume_frac=volfrac)
 
 # loading case object, other classes can be selected and created
-load = Beam(nelx, nely, young, Emin, poisson)
+load = HalfBeam(nelx, nely, young, Emin, poisson)
 
 # FEA object is generated, other solvers can be selected and created
+gtsolver = FESolver(verbose=verbose)
 fesolver = PiNN_FEA(verbose=verbose)
 
 # create optimizer object and initialise the problem

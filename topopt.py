@@ -114,7 +114,7 @@ class Topopt(object):
         while (change > delta) and (self.itr < maxiter):
             try:
                 self.itr += 1
-                change, c = self.iter(penal, rmin, filt)
+                change, c = self.iter(penal, rmin, filt, self.itr)
 
                 if self.verbose:
                     print('It., {0:4d},  Comp., {1:8.2f},  ch., {2:0.3f}'.format(self.itr, c, change), flush=True)
@@ -135,7 +135,7 @@ class Topopt(object):
             return xf, None
 
     # iteration
-    def iter(self, penal, rmin, filt):
+    def iter(self, penal, rmin, filt, iter_):
         """
         This funcion performs one itteration of the topology optimisation
         problem. It
@@ -177,7 +177,7 @@ class Topopt(object):
         xf = self.densityfilt(rmin, filt)
 
         # displacement via FEA
-        u = self.fesolver.displace(load, xf, ke, kmin, penal)
+        u = self.fesolver.displace(load, xf, ke, kmin, penal, iter_)
 
         # compliance, its derivative
         c, dc = self.comp(xf, u, ke, penal)

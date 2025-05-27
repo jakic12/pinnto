@@ -52,7 +52,7 @@ class FESolver(object):
         self.verbose = verbose
 
     # finite element computation for displacement
-    def displace(self, load, x, ke, kmin, penal):
+    def displace(self, load, x, ke, kmin, penal, iter_):
         """
         FE solver based upon the sparse SciPy solver that uses umfpack.
 
@@ -87,7 +87,7 @@ class FESolver(object):
         return u
 
     # sparce stiffness matix assembly
-    def gk_freedofs(self, load, x, ke, kmin, penal):
+    def gk_freedofs(self, load, x, ke, kmin, penal, iter_):
         """
         Generates the global stiffness matrix with deleted fixed degrees of
         freedom. It generates a list with stiffness values and their x and y
@@ -147,7 +147,7 @@ class CvxFEA(FESolver):
         super().__init__(verbose)
 
     # finite element computation for displacement
-    def displace(self, load, x, ke, kmin, penal):
+    def displace(self, load, x, ke, kmin, penal, iter_):
         """
         FE solver based upon a Supernodal Sparse Cholesky Factorization. It
         requires the instalation of the cvx module. [1]_
@@ -247,22 +247,25 @@ class DirichletPINN(nn.Module):
         
         return out
 
-def plot_mixed_arr(arr, load, title=""):
+def plot_mixed_arr(arr, load, title="", iter_=None):
     # Plot the mixed array of size (dim * nely+1 * nelx+1)
     # Reshape the array to (nely+1, nelx+1)
     idx = np.arange(arr.shape[0])
     arr1 = arr[idx % load.dim == 0].reshape((load.nelx+1, load.nely+1)).T
     arr2 = arr[idx % load.dim == 1].reshape((load.nelx+1, load.nely+1)).T
-    # Plot the first dimension
     plt.imshow(arr1, cmap='hot', interpolation='nearest')
     plt.colorbar()
     plt.title(f"{title} x-dim")
-    plt.show()
+    plt.savefig(f"plots/x_dim_iter_{iter_}.png")
+
+    plt.clf()
     # Plot the second dimension
     plt.imshow(arr2, cmap='hot', interpolation='nearest')
     plt.colorbar()
     plt.title(f"{title} y-dim")
-    plt.show()
+    plt.savefig(f"plots/y_dim_iter_{iter_}.png")
+    plt.clf()
+    
 
 class PiNN_FEA(FESolver):
     """
@@ -274,7 +277,7 @@ class PiNN_FEA(FESolver):
     verbose : bool
         False if the FEA should not print updates.
     """
-    def __init__(self, verbose=False, epochs=1000, learning_rate=0.001, early_stopping=1000):
+    def __init__(self, verbose=False, epochs=1000, learning_rate=0.001, early_stopping=50):
         super().__init__(verbose)
 
         self.epochs = epochs
@@ -312,11 +315,11 @@ class PiNN_FEA(FESolver):
         u = torch.tensor(np.zeros((load.nely+1, load.nelx+1)), dtype=torch.float32)
         v = torch.tensor(np.zeros((load.nely+1, load.nelx+1)), dtype=torch.float32)
 
-        points_int = np.array(points.detach().numpy()).astype(int)
+        # points_int = np.array(points.detach().numpy()).astype(int)
 
 
-        u[points_int[:, 1], points_int[:, 0]] = output[:, 0]
-        v[points_int[:, 1], points_int[:, 0]] = output[:, 1]
+        u[points[:, 1].int(), points[:, 0].int()] = output[:, 0]
+        v[points[:, 1].int(), points[:, 0].int()] = output[:, 1]
 
         # Calculate the gradient of the output with respect to the input
         grad_ux = torch.autograd.grad(outputs=output[:, 0], inputs=points,
@@ -350,7 +353,7 @@ class PiNN_FEA(FESolver):
         node_density_matrix = F.max_pool2d(density.unsqueeze(0), kernel_size=2, stride=1, padding=1)[0]
 
         # Calculate the internal strain energy
-        Ein = (0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 0.5 * sigma_xy * eps_xy) * node_density_matrix[points_int[:, 1], points_int[:, 0]].reshape(-1)).mean()
+        Ein = (0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 0.5 * sigma_xy * eps_xy) * node_density_matrix[points[:, 1].int(), points[:, 0].int()].reshape(-1)).mean()
 
         # Calculate the external work done by the loads
         u_ext = u[force_in_x[:, 1], force_in_x[:, 0]]
@@ -364,12 +367,12 @@ class PiNN_FEA(FESolver):
         mag_force_in_y = ext_forces[load.node(force_in_y[:, 1], force_in_y[:, 0])+1]
         density_in_y = node_density_matrix[force_in_y[:, 1], force_in_y[:, 0]]
 
-        Eex = torch.mean(mag_force_in_x * u_ext * density_in_x) + torch.mean(mag_force_in_y * v_ext * density_in_y)
+        Eex = torch.mean(mag_force_in_x * u_ext) + torch.mean(mag_force_in_y * v_ext)
 
         return Ein - Eex
 
     # finite element computation for displacement
-    def displace(self, load, x, ke, kmin, penal):
+    def displace(self, load, x, ke, kmin, penal, iter_):
         """
         FE solver based upon a Supernodal Sparse Cholesky Factorization. It
         requires the instalation of the cvx module. [1]_
@@ -392,10 +395,15 @@ class PiNN_FEA(FESolver):
         u : 1-D array len(max(edof))
             Displacement of all degrees of freedom
         """
+
+        density = torch.tensor(x)**penal
+
         fixed_points = np.array(load.fixdofs())
 
         fixed_in_x_idx = torch.tensor(load.elpos(fixed_points[fixed_points % load.dim == 1]//2))
         fixed_in_y_idx = torch.tensor(load.elpos((fixed_points[fixed_points % load.dim == 0]-1)//2))
+
+        print(fixed_in_x_idx)
 
         # h1_i(0,y) = u0_i(y)
         # h1_i(1,y) = u1_i(y)
@@ -415,10 +423,23 @@ class PiNN_FEA(FESolver):
             lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 1] == 0, 0]).int()).int(),
             lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 1] == 1, 0]).int()).int(),
         )
+
+        # test boundary conditions
+        # x = torch.linspace(0, 1, 100).unsqueeze(1)
+        # plt.plot(x, u_fixed.u0(x), label='u0')
+        # plt.plot(x, u_fixed.u1(x), label='u1')
+        # plt.plot(x, v_fixed.v0(x), label='v0')
+        # plt.plot(x, v_fixed.v1(x), label='v1')
+        # plt.xlabel('x')
+        # plt.ylabel('Boundary condition')
+        # plt.title('Boundary conditions')
+        # plt.legend()
+        # plt.show()
+
     
         #model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed])
-        model = DirichletPINN([200], [u_fixed, v_fixed])
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.2, betas=(0.9, 0.999))#self.learning_rate)
+        model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed])
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999))#self.learning_rate)
         # x = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
         # y = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
         # points = torch.cat([x, y], dim=1)
@@ -432,17 +453,27 @@ class PiNN_FEA(FESolver):
         # free_points array.
         all_free_points = np.unique(np.concat([free_in_x_idx, free_in_y_idx-1]))
 
-        points = torch.tensor(load.elpos(all_free_points//2).astype(np.float32)).requires_grad_(True)
         free_in_x = load.elpos(free_in_x_idx//2)
         free_in_y = load.elpos((free_in_y_idx-1)//2)
         force_arr = torch.tensor(np.array(load.force()))
+
+        u = np.zeros(load.dim*(load.nely+1)*(load.nelx+1))
+        points_x = torch.linspace(0, load.nelx, load.nelx+1)
+        points_y = torch.linspace(0, load.nely, load.nely+1)
+        grid_y, grid_x = torch.meshgrid(points_y, points_x, indexing='ij')
+        grid_x = grid_x.flatten()
+        grid_y = grid_y.flatten()
+        x = grid_x / (load.nelx + 1)
+        y = grid_y / (load.nely + 1)
 
         best_loss = np.inf
         early_stopping_counter = 0
         for i in range(self.epochs):
             optimizer.zero_grad()
+            points = torch.stack([x, y], dim=1).requires_grad_(True)
+            
             output = model(points / torch.tensor([load.nelx+1, load.nely+1]))
-            loss = self.calculate_energy_loss(load, points, output, free_in_x, free_in_y, force_arr, torch.tensor(x))
+            loss = self.calculate_energy_loss(load, points, output, free_in_x, free_in_y, force_arr, density)
 
             loss.backward()
             print(f"Epoch {i+1}/{self.epochs}, Loss: {loss.item()}")
@@ -458,22 +489,13 @@ class PiNN_FEA(FESolver):
                     print(f"Early stopping at epoch {i}")
                     break
         
-        # Get the output of the model for the grid points
-        u = np.zeros(load.dim*(load.nely+1)*(load.nelx+1))
-        points_x = torch.linspace(0, load.nelx, load.nelx+1)
-        points_y = torch.linspace(0, load.nely, load.nely+1)
-        grid_y, grid_x = torch.meshgrid(points_y, points_x, indexing='ij')
-        grid_x = grid_x.flatten()
-        grid_y = grid_y.flatten()
+        grid_x = np.array(grid_x.int().detach().numpy())
+        grid_y = np.array(grid_y.int().detach().numpy())
 
-        # print(grid_x.shape, grid_y.shape, (load.nely+1)*(load.nelx+1), (load.nely+1,load.nelx+1))
-        x = grid_x / (load.nelx + 1)
-        y = grid_y / (load.nely + 1)
-        out = model(torch.stack([x, y], dim=1).requires_grad_(True)).detach().numpy()
-        u[load.node(grid_x.int(), grid_y.int())*2+1] = out[:, 0]
-        u[load.node(grid_x.int(), grid_y.int())*2] = out[:, 1]
+        u[load.node(grid_x, grid_y)*2+1] = output[:, 0].detach().numpy()
+        u[load.node(grid_x, grid_y)*2] = output[:, 1].detach().numpy()
         
-        plot_mixed_arr(u, load, title="Displacement field")
+        plot_mixed_arr(u, load, "Displacement field", iter_)
 
         return u
 
@@ -497,7 +519,7 @@ class CGFEA(FESolver):
         self.ufree_old = None
 
     # finite element computation for displacement
-    def displace(self, load, x, ke, kmin, penal):
+    def displace(self, load, x, ke, kmin, penal, iter_):
         """
         FE solver based upon the sparse SciPy solver that uses a preconditioned
         conjugate gradient solver, preconditioning is based upon the inverse
