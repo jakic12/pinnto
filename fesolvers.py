@@ -29,6 +29,10 @@ import torch
 import torch.nn.functional as F
 from collections import namedtuple
 
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 class FESolver(object):
     """
@@ -78,7 +82,7 @@ class FESolver(object):
         nely, nelx = x.shape
 
         f_free = load.force()[freedofs]
-        k_free = self.gk_freedofs(load, x, ke, kmin, penal)
+        k_free = self.gk_freedofs(load, x, ke, kmin, penal, iter_)
 
         # solving the system f = Ku with scipy
         u = np.zeros(load.dim*(nely+1)*(nelx+1))
@@ -194,16 +198,9 @@ class CvxFEA(FESolver):
 
         return u
 
-DirichletPINN_params = namedtuple('DirichletPINN_params', ['u0', 'u1', 'v0', 'v1'])
-example = DirichletPINN_params(
-    lambda y: 0,
-    lambda y: 0,
-    lambda x: torch.sin(2 * np.pi * x),
-    lambda x: torch.sin(2 * np.pi * x),
-)
-
+FixedBoundaries = namedtuple('FixedBoundaries', ['left', 'right', 'bottom', 'top'])
 class DirichletPINN(nn.Module):
-    def __init__(self, hidden_shape, arr_params, activation=nn.Sigmoid()):
+    def __init__(self, hidden_shape, arr_params, activation=nn.Sigmoid(), boundary_slope=40):
         super(DirichletPINN, self).__init__()
         self.nn_shape = [2, *hidden_shape, 2]
         self.nn_layers = nn.ModuleList()
@@ -215,6 +212,56 @@ class DirichletPINN(nn.Module):
 
         # remove the last activation
         self.nn_layers = self.nn_layers[:-1]
+        self.boundary_slope = boundary_slope
+
+    def fix_boundary(self, x):
+        return 2/(1 + torch.exp(-self.boundary_slope * x)) - 1
+
+    
+    def visualize_params(self):
+        x = torch.linspace(0, 1, 100)
+        y = torch.linspace(0, 1, 100)
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        points = torch.stack([X.flatten(), Y.flatten()], dim=1)
+
+        out = torch.zeros(points.shape[0], self.nn_shape[-1])
+        for i in range(self.nn_shape[-1]):
+            left, right, bottom, top = self.params[i]
+            out[:, i] += 1
+            if left:
+                out[:, i] *= self.fix_boundary(points[:, 0])
+            if right:
+                out[:, i] *= self.fix_boundary(1 - points[:, 0])
+            if bottom:
+                out[:, i] *= self.fix_boundary(points[:, 1])
+            if top:
+                out[:, i] *= self.fix_boundary(1 - points[:, 1])
+            
+        
+        plt.figure(figsize=(10, 5))
+        for i in range(self.nn_shape[-1]):
+            plt.subplot(1, self.nn_shape[-1], i+1)
+            plt.imshow(out[:, i].reshape(X.shape).T.detach().cpu().numpy(), cmap='viridis', extent=(0, 1, 0, 1))
+            plt.title(f'Output {i}')
+            plt.colorbar()
+        
+        plt.tight_layout()
+        plt.show()
+
+    def forward_only_network(self, X):
+        """
+        Forward pass through the neural network without applying the boundary conditions.
+
+        Parameters
+        ----------
+        X : torch.Tensor
+            Input tensor of shape (batch_size, 2) where the first column
+            is x and the second column is y.
+        """
+        model_out = X
+        for layer in self.nn_layers:
+            model_out = layer(model_out)
+        return model_out
 
     
     def forward(self, X):
@@ -229,42 +276,71 @@ class DirichletPINN(nn.Module):
             Input tensor of shape (batch_size, 2) where the first column
             is x and the second column is y.
         """
-        model_out = X
-        for layer in self.nn_layers:
-            model_out = layer(model_out)
+        model_out = self.forward_only_network(X)
 
-        out = torch.zeros(X.shape[0], self.nn_shape[-1])
+        out = torch.zeros(X.shape[0], self.nn_shape[-1]).to(device=device)
         for i in range(self.nn_shape[-1]):
-            u0, u1, v0, v1 = self.params[i]
-            # Trial solution is in the form of y_{i,t}(x,y) = h1_i(x,y) + model_i(x,y)*h2_i(x,y)
-            # h1_i(0,y) = u0_i(y)
-            # h1_i(1,y) = u1_i(y)
-            # h1_i(x,0) = v0_i(x)
-            # h1_i(x,1) = v1_i(x)
-            h1 = lambda x,y: (1 - x) * u0(y) + x * u1(y) + (1 - y) * v0(x) + y * v1(x)
-            h2 = lambda x,y: x * (1 - x) * y * (1 - y)
-            out[:, i] = h1(X[:, 0], X[:, 1]) + model_out[:, i] * h2(X[:, 0], X[:, 1])
+            left, right, bottom, top = self.params[i]
+            out[:, i] = model_out[:, i]
+            if left:
+                out[:, i] *= self.fix_boundary(X[:, 0])
+            if right:
+                out[:, i] *= self.fix_boundary(1 - X[:, 0])
+            if bottom:
+                out[:, i] *= self.fix_boundary(X[:, 1])
+            if top:
+                out[:, i] *= self.fix_boundary(1 - X[:, 1])
         
         return out
 
-def plot_mixed_arr(arr, load, title="", iter_=None):
+def plot_mixed_arr(arr, load, title=""):
+    idx = np.arange(arr.shape[0])
+    arr1 = arr[idx % load.dim == 0].reshape((load.nelx+1, load.nely+1)).T
+    arr2 = arr[idx % load.dim == 1].reshape((load.nelx+1, load.nely+1)).T
+
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+    axs[0].imshow(arr1, cmap='viridis')
+    axs[0].set_title(f"{title} x-dim")
+    axs[1].imshow(arr2, cmap='viridis')
+    axs[1].set_title(f"{title} y-dim")
+    for ax in axs.flat:
+        fig.colorbar(ax.images[0], ax=ax, orientation='vertical')
+    plt.tight_layout()
+    plt.show()
+
+def plot_displacement(arr, load, title="", iter_=None, gt=None):
     # Plot the mixed array of size (dim * nely+1 * nelx+1)
     # Reshape the array to (nely+1, nelx+1)
     idx = np.arange(arr.shape[0])
     arr1 = arr[idx % load.dim == 0].reshape((load.nelx+1, load.nely+1)).T
     arr2 = arr[idx % load.dim == 1].reshape((load.nelx+1, load.nely+1)).T
-    plt.imshow(arr1, cmap='hot', interpolation='nearest')
-    plt.colorbar()
-    plt.title(f"{title} x-dim")
-    plt.savefig(f"plots/x_dim_iter_{iter_}.png")
 
-    plt.clf()
-    # Plot the second dimension
-    plt.imshow(arr2, cmap='hot', interpolation='nearest')
-    plt.colorbar()
-    plt.title(f"{title} y-dim")
-    plt.savefig(f"plots/y_dim_iter_{iter_}.png")
-    plt.clf()
+    arr1_gt = gt[idx % load.dim == 0].reshape((load.nelx+1, load.nely+1)).T
+    arr2_gt = gt[idx % load.dim == 1].reshape((load.nelx+1, load.nely+1)).T
+
+    fig, axs = plt.subplots(2, 3, figsize=(15, 5))
+
+    axs[0, 0].imshow(arr1, cmap='viridis')
+    axs[0, 0].set_title(f"{title} x-dim")
+    
+    axs[1,0].imshow(arr2, cmap='viridis')
+    axs[1,0].set_title(f"{title} y-dim")
+    axs[0,1].imshow(arr1_gt, cmap='viridis')
+    axs[0,1].set_title(f"GT {title} x-dim")
+    axs[1,1].imshow(arr2_gt, cmap='viridis')
+    axs[1,1].set_title(f"GT {title} y-dim")
+    axs[0,2].imshow(arr1 - arr1_gt, cmap='viridis')
+    axs[0,2].set_title(f"Difference {title} x-dim")
+    axs[1,2].imshow(arr2 - arr2_gt, cmap='viridis')
+    axs[1,2].set_title(f"Difference {title} y-dim")
+
+    for ax in axs.flat:
+        fig.colorbar(ax.images[0], ax=ax, orientation='vertical')
+    plt.tight_layout()
+    fig.savefig(f"plots/{title}_iter_{iter_}.png")
+    plt.close(fig)
+
+
     
 
 class PiNN_FEA(FESolver):
@@ -277,16 +353,48 @@ class PiNN_FEA(FESolver):
     verbose : bool
         False if the FEA should not print updates.
     """
-    def __init__(self, verbose=False, epochs=1000, learning_rate=0.001, early_stopping=50):
+    def __init__(self, verbose=False, epochs=3000, learning_rate=0.0001, early_stopping=500, gt_solver=None, Emin=1e-9, plotting=False):
         super().__init__(verbose)
 
         self.epochs = epochs
         self.learning_rate = learning_rate
         self.early_stopping = early_stopping
+        self.gt_solver = gt_solver
+        self.Emin = Emin
+        
+        if self.gt_solver is None:
+            self.gt_solver = FESolver(verbose=verbose)
+
+        self.plotting = plotting
+        if self.plotting:
+            fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+            self.imshowU = axs[0].imshow(np.zeros((100+1, 100+1)), cmap='viridis')
+            axs[0].set_title(f"u")
+            self.imshowV = axs[1].imshow(np.zeros((100+1, 100+1)), cmap='viridis')
+            axs[1].set_title(f"v")
+            plt.show(block=False)
+        
+    def plot_uv_lattice_non_block(self, arr, load):
+        if not self.plotting:
+            return
+        
+        idx = np.arange(arr.shape[0])
+        arr1 = arr[idx % load.dim == 0].reshape((load.nelx+1, load.nely+1)).T
+        arr2 = arr[idx % load.dim == 1].reshape((load.nelx+1, load.nely+1)).T
+        
+        self.imshowU.set_data(arr1)
+        self.imshowV.set_data(arr2)
+
+        self.imshowU.autoscale()
+        self.imshowV.autoscale()
+
+        plt.pause(0.0001)
     
-    def calculate_energy_loss(self, load, points, output, force_in_x, force_in_y, ext_forces, density):
+    def calculate_energy_loss(self, load, points, output, ext_forces, density):
         """
         The loss function is the potential energy of the system.
+
+        ARRAYS ARE FLATTENED USING THE FORTRAN COLUMN MAJOR ORDERING!!!!
         
         Parameters
         ----------
@@ -312,14 +420,13 @@ class PiNN_FEA(FESolver):
         loss : torch.Tensor
             The loss value.
         """
-        u = torch.tensor(np.zeros((load.nely+1, load.nelx+1)), dtype=torch.float32)
-        v = torch.tensor(np.zeros((load.nely+1, load.nelx+1)), dtype=torch.float32)
+        u = torch.tensor(np.zeros((load.nely+1, load.nelx+1)), dtype=torch.float32).to(device=device)
+        v = torch.tensor(np.zeros((load.nely+1, load.nelx+1)), dtype=torch.float32).to(device=device)
 
-        # points_int = np.array(points.detach().numpy()).astype(int)
+        points_int = points.int().to(device=device)
 
-
-        u[points[:, 1].int(), points[:, 0].int()] = output[:, 0]
-        v[points[:, 1].int(), points[:, 0].int()] = output[:, 1]
+        u[points_int[:, 1], points_int[:, 0]] = output[:, 0]
+        v[points_int[:, 1], points_int[:, 0]] = output[:, 1]
 
         # Calculate the gradient of the output with respect to the input
         grad_ux = torch.autograd.grad(outputs=output[:, 0], inputs=points,
@@ -339,40 +446,61 @@ class PiNN_FEA(FESolver):
         eps_yy = uyy
         eps_xy = 0.5 * (uxy + uyx)
 
-        E = load.young
         nu = load.poisson
+
+        # Max pooling on the density matrix
+        node_density_matrix = F.max_pool2d(density.unsqueeze(0), kernel_size=2, stride=1, padding=1)[0].to(device=device)
+        density_list = node_density_matrix[points_int[:, 1], points_int[:, 0]]
+
+        # SIMP penalisation
+        E = self.Emin + (load.young - self.Emin) * density_list # density WAS ALREADY PENALIZED
 
         lambda_ = E * nu / ((1 + nu)*(1-nu))
         mu = E / (2 * (1 + nu))
-
+        
+        # PINNTO
         sigma_xx = lambda_ * (eps_xx + eps_yy) + 2 * mu * eps_xx
         sigma_yy = lambda_ * (eps_xx + eps_yy) + 2 * mu * eps_yy
         sigma_xy = 2 * mu * eps_xy
 
-        # Max pooling on the density matrix
-        node_density_matrix = F.max_pool2d(density.unsqueeze(0), kernel_size=2, stride=1, padding=1)[0]
-
         # Calculate the internal strain energy
-        Ein = (0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 0.5 * sigma_xy * eps_xy) * node_density_matrix[points[:, 1].int(), points[:, 0].int()].reshape(-1)).mean()
+        Ein = (0.5 * (sigma_xx * eps_xx + sigma_yy * eps_yy + 2*sigma_xy * eps_xy)).sum()
+
+        # DMF-TONN
+        # trace_eps = eps_xx + eps_yy
+        # squared_diagonal = eps_xx**2 + eps_yy**2
+        # Ein = (0.5 * lambda_ * trace_eps**2 + mu * (squared_diagonal + 2 * eps_xy**2)) * node_density_matrix[points_int[:, 1], points_int[:, 0]].reshape(-1)
+        # Ein = Ein.mean()
 
         # Calculate the external work done by the loads
-        u_ext = u[force_in_x[:, 1], force_in_x[:, 0]]
-        v_ext = v[force_in_y[:, 1], force_in_y[:, 0]]
 
-        # Magnitude of the external force in the x direction in the points that are free in the x direction
-        mag_force_in_x = ext_forces[load.node(force_in_x[:, 1], force_in_x[:, 0])]
-        density_in_x = node_density_matrix[force_in_x[:, 1], force_in_x[:, 0]]
+        uv_lattice = torch.zeros(load.dim*(load.nely+1)*(load.nelx+1)).to(device=device)
+        idxs = np.array(range((load.nely+1)*(load.nelx+1)))
+        uv_lattice[idxs*2] = u.T.reshape(-1)
+        uv_lattice[idxs*2+1] = v.T.reshape(-1)
 
-        # Magnitude of the external force in the y direction in the points that are free in the y direction
-        mag_force_in_y = ext_forces[load.node(force_in_y[:, 1], force_in_y[:, 0])+1]
-        density_in_y = node_density_matrix[force_in_y[:, 1], force_in_y[:, 0]]
+        if self.plotting:
+            with torch.no_grad():
+                self.plot_uv_lattice_non_block(uv_lattice.cpu(), load)
 
-        Eex = torch.mean(mag_force_in_x * u_ext) + torch.mean(mag_force_in_y * v_ext)
+        ext_forces = ext_forces.to(device=device)
+        
+        Eex = (ext_forces * uv_lattice).sum()
+
+        # with torch.no_grad():
+        #     if Ein - Eex < 1:
+        #         plot_mixed_arr(uv_lattice.cpu(), load, title=f"Displacement field")
+
+        # with torch.no_grad():
+        #     Ein_val = (0.5*(sigma_xx*eps_xx + sigma_yy*eps_yy + 2*sigma_xy*eps_xy)).sum().item()
+        #     Eex_val = (ext_forces * uv_lattice).sum().item()
+        #     print(f"\nEin: {Ein_val:},  Eex: {Eex_val:},  ratio Eex/Ein: {Eex_val/Ein_val}")
+
 
         return Ein - Eex
 
     # finite element computation for displacement
-    def displace(self, load, x, ke, kmin, penal, iter_):
+    def displace(self, load, density_orig, ke, kmin, penal, iter_):
         """
         FE solver based upon a Supernodal Sparse Cholesky Factorization. It
         requires the instalation of the cvx module. [1]_
@@ -396,14 +524,13 @@ class PiNN_FEA(FESolver):
             Displacement of all degrees of freedom
         """
 
-        density = torch.tensor(x)**penal
+        density = torch.tensor(density_orig)**penal
 
         fixed_points = np.array(load.fixdofs())
 
-        fixed_in_x_idx = torch.tensor(load.elpos(fixed_points[fixed_points % load.dim == 1]//2))
-        fixed_in_y_idx = torch.tensor(load.elpos((fixed_points[fixed_points % load.dim == 0]-1)//2))
+        fixed_in_x_idx = torch.tensor(load.elpos(fixed_points[fixed_points % load.dim == 1]//2)).to(device=device)
+        fixed_in_y_idx = torch.tensor(load.elpos((fixed_points[fixed_points % load.dim == 0]-1)//2)).to(device=device)
 
-        print(fixed_in_x_idx)
 
         # h1_i(0,y) = u0_i(y)
         # h1_i(1,y) = u1_i(y)
@@ -411,18 +538,7 @@ class PiNN_FEA(FESolver):
         # h1_i(x,1) = v1_i(x)
 
         # boundary conditions for the x direction
-        u_fixed = DirichletPINN_params(
-            lambda y: 1 - torch.isin((y * (load.nely+1)).int(), (fixed_in_x_idx[fixed_in_x_idx[:, 0] == 0, 1]).int()).int(),
-            lambda y: 1 - torch.isin((y * (load.nely+1)).int(), (fixed_in_x_idx[fixed_in_x_idx[:, 0] == 1, 1]).int()).int(),
-            lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_x_idx[fixed_in_x_idx[:, 1] == 0, 0]).int()).int(),
-            lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_x_idx[fixed_in_x_idx[:, 1] == 1, 0]).int()).int(),
-        )
-        v_fixed = DirichletPINN_params(
-            lambda y: 1 - torch.isin((y * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 0] == 0, 1]).int()).int(),
-            lambda y: 1 - torch.isin((y * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 0] == 1, 1]).int()).int(),
-            lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 1] == 0, 0]).int()).int(),
-            lambda x: 1 - torch.isin((x * (load.nely+1)).int(), (fixed_in_y_idx[fixed_in_y_idx[:, 1] == 1, 0]).int()).int(),
-        )
+        #FixedBoundaries
 
         # test boundary conditions
         # x = torch.linspace(0, 1, 100).unsqueeze(1)
@@ -436,10 +552,13 @@ class PiNN_FEA(FESolver):
         # plt.legend()
         # plt.show()
 
+        u_fixed = FixedBoundaries(left=True, right=False, bottom=False, top=False)
+        v_fixed = FixedBoundaries(left=True, right=False, bottom=False, top=False)
+
     
         #model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed])
-        model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed])
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01, betas=(0.9, 0.999))#self.learning_rate)
+        model = DirichletPINN([80,80,80,80,80,80,80,80], [u_fixed, v_fixed],activation=nn.LeakyReLU()).to(device=device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate, betas=(0.9, 0.999))#self.learning_rate)
         # x = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
         # y = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
         # points = torch.cat([x, y], dim=1)
@@ -457,30 +576,33 @@ class PiNN_FEA(FESolver):
         free_in_y = load.elpos((free_in_y_idx-1)//2)
         force_arr = torch.tensor(np.array(load.force()))
 
-        u = np.zeros(load.dim*(load.nely+1)*(load.nelx+1))
         points_x = torch.linspace(0, load.nelx, load.nelx+1)
         points_y = torch.linspace(0, load.nely, load.nely+1)
         grid_y, grid_x = torch.meshgrid(points_y, points_x, indexing='ij')
         grid_x = grid_x.flatten()
         grid_y = grid_y.flatten()
-        x = grid_x / (load.nelx + 1)
-        y = grid_y / (load.nely + 1)
 
         best_loss = np.inf
         early_stopping_counter = 0
-        for i in range(self.epochs):
+
+        random_sample_n=128
+
+        progress_bar = tqdm(range(self.epochs), desc="Training Progress", unit="epoch")
+        for i in progress_bar:
             optimizer.zero_grad()
-            points = torch.stack([x, y], dim=1).requires_grad_(True)
+
+            # Randomly sample points from the grid
+            points = torch.stack([grid_x, grid_y], dim=1).requires_grad_(True).to(device=device)
             
-            output = model(points / torch.tensor([load.nelx+1, load.nely+1]))
-            loss = self.calculate_energy_loss(load, points, output, free_in_x, free_in_y, force_arr, density)
+            output = model(points / torch.tensor([load.nelx+1, load.nely+1]).to(device=device)).to(device=device)
+            loss = self.calculate_energy_loss(load, points, output, force_arr, density)
 
             loss.backward()
-            print(f"Epoch {i+1}/{self.epochs}, Loss: {loss.item()}")
+            
             optimizer.step()
 
             if loss < best_loss:
-                best_loss = loss
+                best_loss = loss.item()
                 early_stopping_counter = 0
             else:
                 early_stopping_counter += 1
@@ -488,14 +610,20 @@ class PiNN_FEA(FESolver):
                 if early_stopping_counter >= self.early_stopping:
                     print(f"Early stopping at epoch {i}")
                     break
+                    
+            progress_bar.set_postfix({"Loss": f"{loss.item():.10f}", "Best loss": f"{best_loss:.10f}"})
+
+        u = np.zeros(load.dim*(load.nely+1)*(load.nelx+1))
         
         grid_x = np.array(grid_x.int().detach().numpy())
         grid_y = np.array(grid_y.int().detach().numpy())
 
-        u[load.node(grid_x, grid_y)*2+1] = output[:, 0].detach().numpy()
-        u[load.node(grid_x, grid_y)*2] = output[:, 1].detach().numpy()
+        u[load.node(grid_x, grid_y)*2] = output[:, 0].detach().cpu().numpy()
+        u[load.node(grid_x, grid_y)*2+1] = output[:, 1].detach().cpu().numpy()
+
+        u_gt = self.gt_solver.displace(load, density_orig, ke, kmin, penal, iter_)
         
-        plot_mixed_arr(u, load, "Displacement field", iter_)
+        plot_displacement(u, load, "Displacement field", iter_, gt=u_gt)
 
         return u
 
@@ -574,25 +702,3 @@ class CGFEA(FESolver):
                 print('Illegal input or breakdown ', info)
 
         return u
-
-
-if __name__ == '__main__':
-    example = DirichletPINN_params(
-        lambda y: 0,
-        lambda y: 0,
-        lambda x: torch.sin(2 * np.pi * x),
-        lambda x: torch.sin(2 * np.pi * x),
-    )
-
-    model = DirichletPINN([200], [example, example])
-    x = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
-    y = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
-    points = torch.cat([x, y], dim=1)
-    output = model(points)
-    print(output)
-# torch.autograd.grad(outputs=output, inputs=x, grad_outputs=torch.ones_like(output), create_graph=True)[0]
-
-# x = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
-# y = torch.linspace(0, 1, 100).unsqueeze(1).requires_grad_(True)
-# points = torch.cat([x, y], dim=1)
-# output = model(points)

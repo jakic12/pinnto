@@ -54,11 +54,11 @@ history = True
 den_con = DensityConstraint(nelx, nely, move, volume_frac=volfrac)
 
 # loading case object, other classes can be selected and created
-load = HalfBeam(nelx, nely, young, Emin, poisson)
+load = Canti(nelx, nely, young, Emin, poisson)
 
 # FEA object is generated, other solvers can be selected and created
 gtsolver = FESolver(verbose=verbose)
-fesolver = PiNN_FEA(verbose=verbose)
+fesolver = PiNN_FEA(verbose=verbose, gt_solver=gtsolver)
 
 # create optimizer object and initialise the problem
 optimizer = Topopt(den_con, load, fesolver, verbose=verbose)
