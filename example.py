@@ -21,12 +21,12 @@ from plotting import Plot
 
 
 # material properties
-# young = 1
-# poisson = 0.3
+young = 10 
+poisson = 0.5
 
 # material properties (Stainless steel)
-young = 210
-poisson = 0.3
+# young = 210
+# poisson = 0.3
 
 # constraints
 Emin = 1e-9
@@ -34,15 +34,15 @@ volfrac = 0.4
 move = 1
 
 # mesh dimensions
-nelx = 200
-nely = 50
+nelx = 40
+nely = 20
 
 # optimizer parameters
 penal = 3.0
 rmin = 3
 filt = 'sensitivity'
 maxiter = 200
-delta = 0#0.005
+delta = 0.005
 
 # plotting and printing options
 verbose = True
@@ -57,8 +57,9 @@ den_con = DensityConstraint(nelx, nely, move, volume_frac=volfrac)
 load = Canti(nelx, nely, young, Emin, poisson)
 
 # FEA object is generated, other solvers can be selected and created
-gtsolver = FESolver(verbose=verbose)
+gtsolver = CvxFEA(verbose=verbose)
 fesolver = PiNN_FEA(verbose=verbose, gt_solver=gtsolver)
+#fesolver = gtsolver
 
 # create optimizer object and initialise the problem
 optimizer = Topopt(den_con, load, fesolver, verbose=verbose)
@@ -69,7 +70,7 @@ x, x_history = optimizer.layout(penal, rmin, delta, maxiter, filt, history)
 print('Elapsed time is: ', time.time() - t, 'seconds.')
 
 # plotting
-pl = Plot(load, title='Cantilever beam example 200x50 elementen')
+pl = Plot(load, title='Cantilever beam example 200x50')
 pl.boundary(load)
 pl.loading(load)
 
